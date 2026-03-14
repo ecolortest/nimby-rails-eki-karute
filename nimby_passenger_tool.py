@@ -7,6 +7,7 @@ import argparse
 import csv
 import dataclasses
 import datetime as dt
+import json
 import re
 from collections import defaultdict
 from pathlib import Path
@@ -48,6 +49,51 @@ ROW_PATTERN = re.compile(
     r"(?:New|Boarding|Waiting)?$"
 )
 STATION_CODE_PATTERN = re.compile(r"(?P<major>\d+)-(?P<minor>\d+)")
+HEADER_DATE_PATTERN = re.compile(
+    r"(?P<weekday>Monday|Tuesday|Wednesday|Thursday|Friday|Saturday|Sunday)\s+"
+    r"(?P<month>[A-Za-z]+)\s+"
+    r"(?P<day>\d{1,2}),\s+"
+    r"(?P<year>\d{4})",
+    re.IGNORECASE,
+)
+
+DAY_BUCKET_LABELS = {
+    "mon_thu": "月～木",
+    "fri": "金",
+    "sat": "土",
+    "sun": "日",
+}
+
+
+@dataclasses.dataclass
+class StationDefinition:
+    name: str
+    code: Optional[str] = None
+
+
+@dataclasses.dataclass
+class TrainScheduleDefinition:
+    train_id: str
+    service_days: list[str]
+    origin_station: str
+    departure_time: str
+    destination_station: str
+    direction: str
+    vehicle_type: str
+
+
+@dataclasses.dataclass
+class LineDefinition:
+    line_id: str
+    stations: list[StationDefinition]
+    segment_minutes: dict[str, dict[str, int]]
+    schedules: list[TrainScheduleDefinition]
+
+
+@dataclasses.dataclass
+class ToolDatabase:
+    lines: dict[str, LineDefinition]
+    vehicle_types: dict[str, int]
 
 
 def normalize_spaces(text: str) -> str:
@@ -66,6 +112,86 @@ def parse_time_from_header(header_text: str, base_date: dt.date) -> Optional[dt.
             second=int(m.group("second") or 0),
         ),
     )
+
+
+def classify_day_bucket(target_date: dt.date) -> str:
+    weekday = target_date.weekday()
+    if weekday <= 3:
+        return "mon_thu"
+    if weekday == 4:
+        return "fri"
+    if weekday == 5:
+        return "sat"
+    return "sun"
+
+
+def parse_day_context_from_header(header_text: str) -> Optional[dict[str, str]]:
+    m = HEADER_DATE_PATTERN.search(header_text)
+    if not m:
+        return None
+    header_date = dt.datetime.strptime(
+        f"{m.group('weekday').title()} {m.group('month').title()} {m.group('day')} {m.group('year')}",
+        "%A %B %d %Y",
+    ).date()
+    bucket = classify_day_bucket(header_date)
+    return {
+        "weekday": m.group("weekday").title(),
+        "date": header_date.isoformat(),
+        "bucket": bucket,
+        "bucket_label": DAY_BUCKET_LABELS[bucket],
+        "display": f"{DAY_BUCKET_LABELS[bucket]}データ 集計日：{header_date.year}年{header_date.month:02d}月{header_date.day:02d}日",
+    }
+
+
+def default_database() -> ToolDatabase:
+    return ToolDatabase(lines={}, vehicle_types={})
+
+
+def load_database(path: Path) -> ToolDatabase:
+    if not path.exists():
+        return default_database()
+    raw = json.loads(path.read_text(encoding="utf-8"))
+    lines: dict[str, LineDefinition] = {}
+    for line_id, line in raw.get("lines", {}).items():
+        lines[line_id] = LineDefinition(
+            line_id=line_id,
+            stations=[StationDefinition(**station) for station in line.get("stations", [])],
+            segment_minutes=line.get("segment_minutes", {}),
+            schedules=[TrainScheduleDefinition(**s) for s in line.get("schedules", [])],
+        )
+    return ToolDatabase(lines=lines, vehicle_types=raw.get("vehicle_types", {}))
+
+
+def save_database(path: Path, db: ToolDatabase) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "lines": {
+            line_id: {
+                "line_id": line.line_id,
+                "stations": [dataclasses.asdict(station) for station in line.stations],
+                "segment_minutes": line.segment_minutes,
+                "schedules": [dataclasses.asdict(schedule) for schedule in line.schedules],
+            }
+            for line_id, line in db.lines.items()
+        },
+        "vehicle_types": db.vehicle_types,
+    }
+    path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def get_station_order(line: LineDefinition, station: str) -> int:
+    for idx, definition in enumerate(line.stations):
+        if definition.name == station:
+            return idx
+    raise ValueError(f"駅が見つかりません: {station}")
+
+
+def infer_direction(line: LineDefinition, origin: str, destination: str) -> str:
+    origin_idx = get_station_order(line, origin)
+    dest_idx = get_station_order(line, destination)
+    if origin_idx == dest_idx:
+        return "same"
+    return "down" if dest_idx > origin_idx else "up"
 
 
 def parse_boarding_station_from_title(title_text: str) -> tuple[Optional[str], Optional[str]]:
@@ -484,6 +610,123 @@ def cmd_query(args: argparse.Namespace) -> int:
     return 0
 
 
+
+
+def cmd_line_init(args: argparse.Namespace) -> int:
+    db_path = Path(args.db)
+    db = load_database(db_path)
+    if args.line_id in db.lines:
+        raise ValueError(f"路線が既に存在します: {args.line_id}")
+
+    if len(args.station_name) != len(args.station_code):
+        raise ValueError("--station-name と --station-code は同数指定してください")
+    stations = [StationDefinition(name=normalize_spaces(name), code=(normalize_station_code(code) if code else None)) for name, code in zip(args.station_name, args.station_code)]
+    db.lines[args.line_id] = LineDefinition(
+        line_id=args.line_id,
+        stations=stations,
+        segment_minutes={},
+        schedules=[],
+    )
+    save_database(db_path, db)
+    print(f"路線を作成しました: {args.line_id} ({len(stations)}駅)")
+    return 0
+
+
+def cmd_line_segment(args: argparse.Namespace) -> int:
+    db_path = Path(args.db)
+    db = load_database(db_path)
+    line = db.lines.get(args.line_id)
+    if not line:
+        raise ValueError(f"路線が見つかりません: {args.line_id}")
+    get_station_order(line, args.from_station)
+    get_station_order(line, args.to_station)
+
+    key = f"{args.from_station}->{args.to_station}"
+    reverse_key = f"{args.to_station}->{args.from_station}"
+    line.segment_minutes[key] = {"up": args.up_minutes, "down": args.down_minutes}
+    line.segment_minutes[reverse_key] = {"up": args.down_minutes, "down": args.up_minutes}
+    save_database(db_path, db)
+    print(f"駅間時分を保存しました: {key} (up={args.up_minutes}, down={args.down_minutes})")
+    return 0
+
+
+def cmd_vehicle_add(args: argparse.Namespace) -> int:
+    db_path = Path(args.db)
+    db = load_database(db_path)
+    db.vehicle_types[args.name] = args.capacity
+    save_database(db_path, db)
+    print(f"車種を追加/更新しました: {args.name} 定員={args.capacity}")
+    return 0
+
+
+def cmd_vehicle_remove(args: argparse.Namespace) -> int:
+    db_path = Path(args.db)
+    db = load_database(db_path)
+    removed = db.vehicle_types.pop(args.name, None)
+    save_database(db_path, db)
+    if removed is None:
+        print(f"車種は未登録です: {args.name}")
+    else:
+        print(f"車種を削除しました: {args.name}")
+    return 0
+
+
+def cmd_timetable_add(args: argparse.Namespace) -> int:
+    db_path = Path(args.db)
+    db = load_database(db_path)
+    line = db.lines.get(args.line_id)
+    if not line:
+        raise ValueError(f"路線が見つかりません: {args.line_id}")
+    if args.vehicle_type not in db.vehicle_types:
+        raise ValueError(f"車種が見つかりません: {args.vehicle_type}")
+
+    # validate station existence
+    get_station_order(line, args.origin)
+    get_station_order(line, args.destination)
+    parse_hhmmss(args.departure)
+
+    direction = infer_direction(line, args.origin, args.destination)
+    schedule = TrainScheduleDefinition(
+        train_id=args.train_id,
+        service_days=args.service_days,
+        origin_station=args.origin,
+        departure_time=args.departure,
+        destination_station=args.destination,
+        direction=direction,
+        vehicle_type=args.vehicle_type,
+    )
+    line.schedules.append(schedule)
+    save_database(db_path, db)
+    print(f"列車ダイヤを追加しました: {args.train_id} direction={direction}")
+    return 0
+
+
+def cmd_context_from_header(args: argparse.Namespace) -> int:
+    context = parse_day_context_from_header(args.header_text)
+    if not context:
+        print("ヘッダーから曜日/日付を検知できませんでした。")
+        return 1
+    print(context["display"])
+    print(f"分類キー: {context['bucket']}")
+    return 0
+
+
+def cmd_show_db(args: argparse.Namespace) -> int:
+    db = load_database(Path(args.db))
+    payload = {
+        "lines": {
+            line_id: {
+                "stations": [dataclasses.asdict(s) for s in line.stations],
+                "segment_minutes": line.segment_minutes,
+                "schedules": [dataclasses.asdict(s) for s in line.schedules],
+            }
+            for line_id, line in db.lines.items()
+        },
+        "vehicle_types": db.vehicle_types,
+    }
+    print(json.dumps(payload, ensure_ascii=False, indent=2))
+    return 0
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description="NIMBY Rails Ridership分析ツール")
     sub = p.add_subparsers(dest="command", required=True)
@@ -512,6 +755,52 @@ def build_parser() -> argparse.ArgumentParser:
     query.add_argument("--start-time", help="開始時刻 HH:MM または HH:MM:SS")
     query.add_argument("--end-time", help="終了時刻 HH:MM または HH:MM:SS")
     query.set_defaults(func=cmd_query)
+
+    line_init = sub.add_parser("line-init", help="路線データを作成")
+    line_init.add_argument("--db", default="out/planning_db.json", help="DB JSONパス")
+    line_init.add_argument("--line-id", required=True, help="路線ID")
+    line_init.add_argument("--station-name", action="append", required=True, help="駅名 (並び順で複数指定)")
+    line_init.add_argument("--station-code", action="append", required=True, help="駅コード (駅名と同数指定)")
+    line_init.set_defaults(func=cmd_line_init)
+
+    seg = sub.add_parser("line-segment", help="駅間の上り下り所要時分を設定")
+    seg.add_argument("--db", default="out/planning_db.json", help="DB JSONパス")
+    seg.add_argument("--line-id", required=True)
+    seg.add_argument("--from-station", required=True)
+    seg.add_argument("--to-station", required=True)
+    seg.add_argument("--up-minutes", type=int, required=True)
+    seg.add_argument("--down-minutes", type=int, required=True)
+    seg.set_defaults(func=cmd_line_segment)
+
+    vehicle_add = sub.add_parser("vehicle-add", help="車種を追加")
+    vehicle_add.add_argument("--db", default="out/planning_db.json", help="DB JSONパス")
+    vehicle_add.add_argument("--name", required=True, help="車種名")
+    vehicle_add.add_argument("--capacity", type=int, required=True, help="車両定員")
+    vehicle_add.set_defaults(func=cmd_vehicle_add)
+
+    vehicle_remove = sub.add_parser("vehicle-remove", help="車種を削除")
+    vehicle_remove.add_argument("--db", default="out/planning_db.json", help="DB JSONパス")
+    vehicle_remove.add_argument("--name", required=True, help="車種名")
+    vehicle_remove.set_defaults(func=cmd_vehicle_remove)
+
+    tt = sub.add_parser("timetable-add", help="列車ダイヤを追加")
+    tt.add_argument("--db", default="out/planning_db.json", help="DB JSONパス")
+    tt.add_argument("--line-id", required=True)
+    tt.add_argument("--train-id", required=True)
+    tt.add_argument("--service-days", nargs="+", choices=["mon_thu", "fri", "sat", "sun"], required=True)
+    tt.add_argument("--origin", required=True, help="始発駅")
+    tt.add_argument("--departure", required=True, help="始発発車時刻 HH:MM(:SS)")
+    tt.add_argument("--destination", required=True, help="終着駅")
+    tt.add_argument("--vehicle-type", required=True, help="車種")
+    tt.set_defaults(func=cmd_timetable_add)
+
+    ctx = sub.add_parser("detect-day", help="ヘッダ文字列から曜日分類を検知")
+    ctx.add_argument("--header-text", required=True, help="NIMBY Rails上部の日時文字列")
+    ctx.set_defaults(func=cmd_context_from_header)
+
+    show = sub.add_parser("show-db", help="現在のDB内容を表示")
+    show.add_argument("--db", default="out/planning_db.json", help="DB JSONパス")
+    show.set_defaults(func=cmd_show_db)
 
     return p
 
