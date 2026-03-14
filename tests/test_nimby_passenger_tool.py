@@ -1,9 +1,14 @@
 import datetime as dt
 
 from nimby_passenger_tool import (
+    LineDefinition,
     PassengerRecord,
+    StationDefinition,
     classify_direction_bucket,
+    classify_day_bucket,
+    infer_direction,
     parse_boarding_station_from_title,
+    parse_day_context_from_header,
     parse_ridership_rows,
     parse_time_from_header,
     records_to_increment_events,
@@ -92,3 +97,33 @@ def test_user_case_like_direction_totals():
     events = records_to_increment_events(records, True, set(), set(), "down")
     up_total = sum(e.delta_passengers for e in events if e.direction_bucket == "up")
     assert up_total == 4
+
+
+def test_parse_day_context_from_header_and_bucket():
+    context = parse_day_context_from_header("Thursday July 16, 2026 06:21:33")
+    assert context is not None
+    assert context["weekday"] == "Thursday"
+    assert context["bucket"] == "mon_thu"
+    assert "月～木データ 集計日：2026年07月16日" in context["display"]
+
+
+def test_classify_day_bucket():
+    assert classify_day_bucket(dt.date(2026, 7, 13)) == "mon_thu"  # Monday
+    assert classify_day_bucket(dt.date(2026, 7, 17)) == "fri"
+    assert classify_day_bucket(dt.date(2026, 7, 18)) == "sat"
+    assert classify_day_bucket(dt.date(2026, 7, 19)) == "sun"
+
+
+def test_infer_direction_from_station_order():
+    line = LineDefinition(
+        line_id="L-20.1",
+        stations=[
+            StationDefinition(name="A", code="1-1"),
+            StationDefinition(name="B", code="1-2"),
+            StationDefinition(name="C", code="1-3"),
+        ],
+        segment_minutes={},
+        schedules=[],
+    )
+    assert infer_direction(line, "A", "C") == "down"
+    assert infer_direction(line, "C", "B") == "up"
