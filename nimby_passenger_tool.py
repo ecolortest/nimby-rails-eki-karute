@@ -9,9 +9,12 @@ import dataclasses
 import datetime as dt
 import json
 import re
+import sys
 from collections import defaultdict
 from pathlib import Path
 from typing import Iterable, Iterator, Optional
+
+from startup_screen import run_startup_screen, should_launch_startup_screen
 
 
 @dataclasses.dataclass(frozen=True)
@@ -727,9 +730,13 @@ def cmd_show_db(args: argparse.Namespace) -> int:
     print(json.dumps(payload, ensure_ascii=False, indent=2))
     return 0
 
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description="NIMBY Rails Ridership分析ツール")
     sub = p.add_subparsers(dest="command", required=True)
+
+    gui = sub.add_parser("gui", help="起動用GUI画面を表示")
+    gui.set_defaults(func=lambda _args: run_startup_screen())
 
     extract = sub.add_parser("extract", help="映像のRidership画面からスナップショットCSV抽出")
     extract.add_argument("--video", required=True, help="入力動画ファイル")
@@ -805,9 +812,13 @@ def build_parser() -> argparse.ArgumentParser:
     return p
 
 
-def main() -> int:
+def main(argv: Optional[list[str]] = None) -> int:
+    argv = argv if argv is not None else sys.argv[1:]
+    if should_launch_startup_screen(argv):
+        return run_startup_screen()
+
     parser = build_parser()
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
     return args.func(args)
 
 
