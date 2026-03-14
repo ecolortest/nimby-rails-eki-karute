@@ -127,3 +127,10 @@ def test_infer_direction_from_station_order():
     )
     assert infer_direction(line, "A", "C") == "down"
     assert infer_direction(line, "C", "B") == "up"
+
+
+def test_should_launch_startup_screen():
+    from startup_screen import should_launch_startup_screen
+
+    assert should_launch_startup_screen([]) is True
+    assert should_launch_startup_screen(["query"]) is False
