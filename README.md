@@ -97,7 +97,7 @@ python nimby_passenger_tool.py query \
 
 ## 新規: 路線/車両/ダイヤ管理
 
-デフォルトDBは `out/planning_db.json`。
+デフォルトDBは `out/planning_db.sqlite3`（SQLite）です。
 
 ### 路線データ作成
 

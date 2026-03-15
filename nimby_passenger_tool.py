@@ -9,6 +9,7 @@ import dataclasses
 import datetime as dt
 import json
 import re
+import sqlite3
 import sys
 from collections import defaultdict
 from pathlib import Path
@@ -150,36 +151,184 @@ def default_database() -> ToolDatabase:
     return ToolDatabase(lines={}, vehicle_types={})
 
 
+def open_database_connection(path: Path) -> sqlite3.Connection:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(path)
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA foreign_keys = ON")
+    return conn
+
+
+def ensure_database_schema(conn: sqlite3.Connection) -> None:
+    conn.executescript(
+        """
+        CREATE TABLE IF NOT EXISTS lines (
+            line_id TEXT PRIMARY KEY
+        );
+
+        CREATE TABLE IF NOT EXISTS stations (
+            line_id TEXT NOT NULL,
+            position INTEGER NOT NULL,
+            name TEXT NOT NULL,
+            code TEXT,
+            PRIMARY KEY (line_id, position),
+            FOREIGN KEY (line_id) REFERENCES lines(line_id) ON DELETE CASCADE
+        );
+
+        CREATE TABLE IF NOT EXISTS line_segments (
+            line_id TEXT NOT NULL,
+            from_station TEXT NOT NULL,
+            to_station TEXT NOT NULL,
+            up_minutes INTEGER NOT NULL,
+            down_minutes INTEGER NOT NULL,
+            PRIMARY KEY (line_id, from_station, to_station),
+            FOREIGN KEY (line_id) REFERENCES lines(line_id) ON DELETE CASCADE
+        );
+
+        CREATE TABLE IF NOT EXISTS schedules (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            line_id TEXT NOT NULL,
+            train_id TEXT NOT NULL,
+            service_days TEXT NOT NULL,
+            origin_station TEXT NOT NULL,
+            departure_time TEXT NOT NULL,
+            destination_station TEXT NOT NULL,
+            direction TEXT NOT NULL,
+            vehicle_type TEXT NOT NULL,
+            FOREIGN KEY (line_id) REFERENCES lines(line_id) ON DELETE CASCADE
+        );
+
+        CREATE TABLE IF NOT EXISTS vehicle_types (
+            name TEXT PRIMARY KEY,
+            capacity INTEGER NOT NULL
+        );
+        """
+    )
+
+
 def load_database(path: Path) -> ToolDatabase:
     if not path.exists():
         return default_database()
-    raw = json.loads(path.read_text(encoding="utf-8"))
-    lines: dict[str, LineDefinition] = {}
-    for line_id, line in raw.get("lines", {}).items():
-        lines[line_id] = LineDefinition(
-            line_id=line_id,
-            stations=[StationDefinition(**station) for station in line.get("stations", [])],
-            segment_minutes=line.get("segment_minutes", {}),
-            schedules=[TrainScheduleDefinition(**s) for s in line.get("schedules", [])],
-        )
-    return ToolDatabase(lines=lines, vehicle_types=raw.get("vehicle_types", {}))
+
+    with open_database_connection(path) as conn:
+        ensure_database_schema(conn)
+        lines: dict[str, LineDefinition] = {}
+
+        line_rows = conn.execute("SELECT line_id FROM lines ORDER BY line_id").fetchall()
+        for line_row in line_rows:
+            line_id = line_row["line_id"]
+            station_rows = conn.execute(
+                "SELECT name, code FROM stations WHERE line_id = ? ORDER BY position",
+                (line_id,),
+            ).fetchall()
+            segment_rows = conn.execute(
+                """
+                SELECT from_station, to_station, up_minutes, down_minutes
+                FROM line_segments
+                WHERE line_id = ?
+                ORDER BY from_station, to_station
+                """,
+                (line_id,),
+            ).fetchall()
+            schedule_rows = conn.execute(
+                """
+                SELECT train_id, service_days, origin_station, departure_time,
+                       destination_station, direction, vehicle_type
+                FROM schedules
+                WHERE line_id = ?
+                ORDER BY id
+                """,
+                (line_id,),
+            ).fetchall()
+
+            lines[line_id] = LineDefinition(
+                line_id=line_id,
+                stations=[StationDefinition(name=row["name"], code=row["code"]) for row in station_rows],
+                segment_minutes={
+                    f"{row['from_station']}->{row['to_station']}": {
+                        "up": row["up_minutes"],
+                        "down": row["down_minutes"],
+                    }
+                    for row in segment_rows
+                },
+                schedules=[
+                    TrainScheduleDefinition(
+                        train_id=row["train_id"],
+                        service_days=json.loads(row["service_days"]),
+                        origin_station=row["origin_station"],
+                        departure_time=row["departure_time"],
+                        destination_station=row["destination_station"],
+                        direction=row["direction"],
+                        vehicle_type=row["vehicle_type"],
+                    )
+                    for row in schedule_rows
+                ],
+            )
+
+        vehicle_rows = conn.execute(
+            "SELECT name, capacity FROM vehicle_types ORDER BY name"
+        ).fetchall()
+
+    return ToolDatabase(
+        lines=lines,
+        vehicle_types={row["name"]: row["capacity"] for row in vehicle_rows},
+    )
 
 
 def save_database(path: Path, db: ToolDatabase) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    payload = {
-        "lines": {
-            line_id: {
-                "line_id": line.line_id,
-                "stations": [dataclasses.asdict(station) for station in line.stations],
-                "segment_minutes": line.segment_minutes,
-                "schedules": [dataclasses.asdict(schedule) for schedule in line.schedules],
-            }
-            for line_id, line in db.lines.items()
-        },
-        "vehicle_types": db.vehicle_types,
-    }
-    path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    with open_database_connection(path) as conn:
+        ensure_database_schema(conn)
+        with conn:
+            conn.execute("DELETE FROM schedules")
+            conn.execute("DELETE FROM line_segments")
+            conn.execute("DELETE FROM stations")
+            conn.execute("DELETE FROM lines")
+            conn.execute("DELETE FROM vehicle_types")
+
+            for line_id, line in db.lines.items():
+                conn.execute("INSERT INTO lines(line_id) VALUES (?)", (line_id,))
+                for position, station in enumerate(line.stations):
+                    conn.execute(
+                        """
+                        INSERT INTO stations(line_id, position, name, code)
+                        VALUES (?, ?, ?, ?)
+                        """,
+                        (line_id, position, station.name, station.code),
+                    )
+                for segment_key, minutes in line.segment_minutes.items():
+                    from_station, to_station = segment_key.split("->", 1)
+                    conn.execute(
+                        """
+                        INSERT INTO line_segments(line_id, from_station, to_station, up_minutes, down_minutes)
+                        VALUES (?, ?, ?, ?, ?)
+                        """,
+                        (line_id, from_station, to_station, minutes["up"], minutes["down"]),
+                    )
+                for schedule in line.schedules:
+                    conn.execute(
+                        """
+                        INSERT INTO schedules(
+                            line_id, train_id, service_days, origin_station, departure_time,
+                            destination_station, direction, vehicle_type
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        (
+                            line_id,
+                            schedule.train_id,
+                            json.dumps(schedule.service_days, ensure_ascii=False),
+                            schedule.origin_station,
+                            schedule.departure_time,
+                            schedule.destination_station,
+                            schedule.direction,
+                            schedule.vehicle_type,
+                        ),
+                    )
+
+            for name, capacity in db.vehicle_types.items():
+                conn.execute(
+                    "INSERT INTO vehicle_types(name, capacity) VALUES (?, ?)",
+                    (name, capacity),
+                )
 
 
 def get_station_order(line: LineDefinition, station: str) -> int:
@@ -764,14 +913,14 @@ def build_parser() -> argparse.ArgumentParser:
     query.set_defaults(func=cmd_query)
 
     line_init = sub.add_parser("line-init", help="路線データを作成")
-    line_init.add_argument("--db", default="out/planning_db.json", help="DB JSONパス")
+    line_init.add_argument("--db", default="out/planning_db.sqlite3", help="SQLite DBパス")
     line_init.add_argument("--line-id", required=True, help="路線ID")
     line_init.add_argument("--station-name", action="append", required=True, help="駅名 (並び順で複数指定)")
     line_init.add_argument("--station-code", action="append", required=True, help="駅コード (駅名と同数指定)")
     line_init.set_defaults(func=cmd_line_init)
 
     seg = sub.add_parser("line-segment", help="駅間の上り下り所要時分を設定")
-    seg.add_argument("--db", default="out/planning_db.json", help="DB JSONパス")
+    seg.add_argument("--db", default="out/planning_db.sqlite3", help="SQLite DBパス")
     seg.add_argument("--line-id", required=True)
     seg.add_argument("--from-station", required=True)
     seg.add_argument("--to-station", required=True)
@@ -780,18 +929,18 @@ def build_parser() -> argparse.ArgumentParser:
     seg.set_defaults(func=cmd_line_segment)
 
     vehicle_add = sub.add_parser("vehicle-add", help="車種を追加")
-    vehicle_add.add_argument("--db", default="out/planning_db.json", help="DB JSONパス")
+    vehicle_add.add_argument("--db", default="out/planning_db.sqlite3", help="SQLite DBパス")
     vehicle_add.add_argument("--name", required=True, help="車種名")
     vehicle_add.add_argument("--capacity", type=int, required=True, help="車両定員")
     vehicle_add.set_defaults(func=cmd_vehicle_add)
 
     vehicle_remove = sub.add_parser("vehicle-remove", help="車種を削除")
-    vehicle_remove.add_argument("--db", default="out/planning_db.json", help="DB JSONパス")
+    vehicle_remove.add_argument("--db", default="out/planning_db.sqlite3", help="SQLite DBパス")
     vehicle_remove.add_argument("--name", required=True, help="車種名")
     vehicle_remove.set_defaults(func=cmd_vehicle_remove)
 
     tt = sub.add_parser("timetable-add", help="列車ダイヤを追加")
-    tt.add_argument("--db", default="out/planning_db.json", help="DB JSONパス")
+    tt.add_argument("--db", default="out/planning_db.sqlite3", help="SQLite DBパス")
     tt.add_argument("--line-id", required=True)
     tt.add_argument("--train-id", required=True)
     tt.add_argument("--service-days", nargs="+", choices=["mon_thu", "fri", "sat", "sun"], required=True)
@@ -806,7 +955,7 @@ def build_parser() -> argparse.ArgumentParser:
     ctx.set_defaults(func=cmd_context_from_header)
 
     show = sub.add_parser("show-db", help="現在のDB内容を表示")
-    show.add_argument("--db", default="out/planning_db.json", help="DB JSONパス")
+    show.add_argument("--db", default="out/planning_db.sqlite3", help="SQLite DBパス")
     show.set_defaults(func=cmd_show_db)
 
     return p
