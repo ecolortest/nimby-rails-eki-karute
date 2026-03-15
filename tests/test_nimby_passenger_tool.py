@@ -4,14 +4,19 @@ from nimby_passenger_tool import (
     LineDefinition,
     PassengerRecord,
     StationDefinition,
+    ToolDatabase,
+    TrainScheduleDefinition,
+    build_parser,
     classify_direction_bucket,
     classify_day_bucket,
     infer_direction,
+    load_database,
     parse_boarding_station_from_title,
     parse_day_context_from_header,
     parse_ridership_rows,
     parse_time_from_header,
     records_to_increment_events,
+    save_database,
 )
 
 
@@ -134,3 +139,45 @@ def test_should_launch_startup_screen():
 
     assert should_launch_startup_screen([]) is True
     assert should_launch_startup_screen(["query"]) is False
+
+
+def test_planning_db_sqlite_roundtrip(tmp_path):
+    db_path = tmp_path / "planning_db.sqlite3"
+    db = ToolDatabase(
+        lines={
+            "L-20.1": LineDefinition(
+                line_id="L-20.1",
+                stations=[
+                    StationDefinition(name="Karang Setra", code="4-10"),
+                    StationDefinition(name="Bandung", code="4-15"),
+                ],
+                segment_minutes={"Karang Setra->Bandung": {"up": 14, "down": 12}},
+                schedules=[
+                    TrainScheduleDefinition(
+                        train_id="T1001",
+                        service_days=["mon_thu", "fri"],
+                        origin_station="Karang Setra",
+                        departure_time="06:24:00",
+                        destination_station="Bandung",
+                        direction="down",
+                        vehicle_type="6cars_local",
+                    )
+                ],
+            )
+        },
+        vehicle_types={"6cars_local": 820},
+    )
+
+    save_database(db_path, db)
+    loaded = load_database(db_path)
+
+    assert loaded.vehicle_types == {"6cars_local": 820}
+    assert loaded.lines["L-20.1"].stations[0].name == "Karang Setra"
+    assert loaded.lines["L-20.1"].segment_minutes["Karang Setra->Bandung"] == {"up": 14, "down": 12}
+    assert loaded.lines["L-20.1"].schedules[0].service_days == ["mon_thu", "fri"]
+
+
+def test_planning_command_default_db_path_is_sqlite():
+    parser = build_parser()
+    args = parser.parse_args(["show-db"])
+    assert args.db == "out/planning_db.sqlite3"
