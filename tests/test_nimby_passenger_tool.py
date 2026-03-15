@@ -1,3 +1,4 @@
+from pathlib import Path
 import datetime as dt
 
 from nimby_passenger_tool import (
@@ -139,6 +140,22 @@ def test_should_launch_startup_screen():
 
     assert should_launch_startup_screen([]) is True
     assert should_launch_startup_screen(["query"]) is False
+
+
+def test_build_line_selection_title_uses_db_filename_only():
+    from line_selection_screen import build_line_selection_title
+
+    title = build_line_selection_title(Path("/tmp/projects/sample.db"))
+    assert title == "路線選択画面（DBファイル名: sample.db）"
+
+
+def test_startup_line_storage_roundtrip(tmp_path):
+    from line_selection_screen import add_line, load_line_ids
+
+    db_path = tmp_path / "startup.db"
+    add_line(db_path, "Bandung Line 4")
+    add_line(db_path, "Bandung Line 3")
+    assert load_line_ids(db_path) == ["Bandung Line 3", "Bandung Line 4"]
 
 
 def test_planning_db_sqlite_roundtrip(tmp_path):
